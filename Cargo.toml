@@ -1,0 +1,18 @@
+[package]
+name = "fixed-cache"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88" # MSRV
+authors = ["DaniPopes <57450786+DaniPopes@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DaniPopes/fixed-cache"
+keywords = ["fixed", "cache", "hash"]
+categories = []
+
+[dependencies]
+rapidhash = { version = "4", default-features = false, optional = true }
+
+[features]
+default = []
+rapidhash = ["dep:rapidhash"]
+nightly = ["rapidhash?/nightly"]
