@@ -10,6 +10,8 @@ keywords = ["fixed", "cache", "hash"]
 categories = []
 
 [dependencies]
+equivalent = "1"
+
 rapidhash = { version = "4", default-features = false, optional = true }
 
 [features]

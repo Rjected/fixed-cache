@@ -12,6 +12,7 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use equivalent::Equivalent;
 
 const LOCKED_BIT: usize = 0x0000_8000;
 
@@ -31,7 +32,7 @@ type DefaultBuildHasher = std::hash::RandomState;
 /// - `V`: The value type, must implement `Clone`.
 /// - `S`: The hash builder type, must implement `BuildHasher`.
 pub struct Cache<K, V, S = DefaultBuildHasher> {
-    entries: *const [Entry<(K, V)>],
+    entries: *const [Bucket<(K, V)>],
     build_hasher: S,
 }
 
@@ -41,7 +42,7 @@ impl<K, V, S> core::fmt::Debug for Cache<K, V, S> {
     }
 }
 
-// SAFETY: `Cache` is safe to share across threads because `Entry` uses atomic operations.
+// SAFETY: `Cache` is safe to share across threads because `Bucket` uses atomic operations.
 unsafe impl<K: Send, V: Send, S: Send> Send for Cache<K, V, S> {}
 unsafe impl<K: Send, V: Send, S: Sync> Sync for Cache<K, V, S> {}
 
@@ -56,7 +57,7 @@ where
     ///
     /// Panics if `entries.len()` is not a power of two.
     #[inline]
-    pub const fn new_static(entries: &'static [Entry<(K, V)>], build_hasher: S) -> Self {
+    pub const fn new_static(entries: &'static [Bucket<(K, V)>], build_hasher: S) -> Self {
         assert!(entries.len().is_power_of_two());
         Self { entries, build_hasher }
     }
@@ -84,57 +85,91 @@ where
     pub const fn capacity(&self) -> usize {
         self.entries.len()
     }
+}
+
+impl<K, V, S> Cache<K, V, S>
+where
+    K: Hash + Eq,
+    V: Clone,
+    S: BuildHasher,
+{
+    /// Get
+    pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
+        let (bucket, tag) = self.calc(key);
+        self.get_inner(key, bucket, tag)
+    }
+
+    #[inline]
+    fn get_inner<Q: ?Sized + Hash + Equivalent<K>>(
+        &self,
+        key: &Q,
+        bucket: &Bucket<(K, V)>,
+        tag: usize,
+    ) -> Option<V> {
+        if bucket.try_lock(Some(tag)) {
+            // SAFETY: We hold the lock, so we have exclusive access.
+            let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
+            if key.equivalent(ck) {
+                let v = v.clone();
+                bucket.unlock(tag);
+                return Some(v);
+            }
+            bucket.unlock(tag);
+            // Hash collision: same hash but different key.
+        }
+
+        None
+    }
+
+    /// Insert
+    pub fn insert(&self, key: K, value: V) {
+        let (bucket, tag) = self.calc(&key);
+        self.insert_inner(key, value, bucket, tag);
+    }
+
+    #[inline]
+    fn insert_inner(&self, key: K, value: V, bucket: &Bucket<(K, V)>, tag: usize) -> V {
+        if bucket.try_lock(None) {
+            // SAFETY: We hold the lock, so we have exclusive access.
+            unsafe {
+                let data = (&mut *bucket.data.get()).as_mut_ptr();
+                (&raw mut (*data).0).write(key);
+                (&raw mut (*data).1).write(value.clone());
+            }
+            bucket.unlock(tag);
+        }
+        value
+    }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
     ///
     /// If the key is found in the cache, returns a clone of the cached value.
     /// Otherwise, calls `f` to compute the value, attempts to insert it, and returns it.
     #[inline]
-    pub fn get_or_insert_with<F>(&self, key: &K, f: F) -> V
+    pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce(&K) -> V,
         K: Clone,
-        V: Clone,
     {
-        let hash = self.hash_key(key);
-        // SAFETY: index is masked to be within bounds.
-        let entry = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-
-        // Combine hash bits (tag) for quick validation.
-        let tag = hash & self.tag_mask();
-
-        // Try to read from cache.
-        if entry.try_lock(Some(tag)) {
-            // SAFETY: We hold the lock, so we have exclusive access.
-            let (cached_key, cached_value) = unsafe { (*entry.data.get()).assume_init_ref() };
-            if cached_key == key {
-                let cached_value = cached_value.clone();
-                entry.unlock(tag);
-                return cached_value;
-            }
-            entry.unlock(tag);
-            // Hash collision: same tag but different key.
+        let (bucket, tag) = self.calc(&key);
+        if let Some(v) = self.get_inner(&key, bucket, tag) {
+            return v;
         }
-
-        // Cache miss or contention - compute value.
-        let value = f(key);
-
-        // Try to update cache entry if not locked.
-        if entry.try_lock(None) {
-            // SAFETY: We hold the lock, so we have exclusive access.
-            unsafe {
-                let data = (*entry.data.get()).assume_init_mut();
-                data.0.clone_from(key);
-                data.1.clone_from(&value);
-            }
-            entry.unlock(tag);
-        }
-
-        value
+        let value = f(&key);
+        self.insert_inner(key, value, bucket, tag)
     }
 
     #[inline]
-    fn hash_key(&self, key: &K) -> usize {
+    fn calc<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> (&Bucket<(K, V)>, usize) {
+        let hash = self.hash_key(key);
+        // SAFETY: index is masked to be within bounds.
+        let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
+        let tag = hash & self.tag_mask();
+        (bucket, tag)
+    }
+
+    #[inline]
+    fn hash_key<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> usize {
         let hash = self.build_hasher.hash_one(key);
 
         if cfg!(target_pointer_width = "32") {
@@ -145,21 +180,16 @@ where
     }
 }
 
-/// A cache entry.
+/// A cache bucket.
 #[repr(C, align(128))]
-pub struct Entry<T> {
+pub struct Bucket<T> {
     tag: AtomicUsize,
     data: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> core::fmt::Debug for Entry<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Entry").finish_non_exhaustive()
-    }
-}
-
-impl<T> Entry<T> {
-    /// Creates a new zeroed cache entry.
+impl<T> Bucket<T> {
+    /// Creates a new zeroed bucket.
+    #[inline]
     pub const fn new() -> Self {
         Self { tag: AtomicUsize::new(0), data: UnsafeCell::new(MaybeUninit::zeroed()) }
     }
@@ -185,9 +215,9 @@ impl<T> Entry<T> {
     }
 }
 
-// SAFETY: `Entry` is a specialized `Mutex<T>` that never blocks.
-unsafe impl<T: Send> Send for Entry<T> {}
-unsafe impl<T: Send> Sync for Entry<T> {}
+// SAFETY: `Bucket` is a specialized `Mutex<T>` that never blocks.
+unsafe impl<T: Send> Send for Bucket<T> {}
+unsafe impl<T: Send> Sync for Bucket<T> {}
 
 /// Declares a static cache with the given name, key type, value type, and size.
 ///
@@ -213,7 +243,8 @@ macro_rules! static_cache {
         $crate::static_cache!($K, $V, $size, Default::default())
     };
     ($K:ty, $V:ty, $size:expr, $hasher:expr) => {{
-        static ENTRIES: [$crate::Entry<($K, $V)>; $size] = [const { $crate::Entry::new() }; $size];
+        static ENTRIES: [$crate::Bucket<($K, $V)>; $size] =
+            [const { $crate::Bucket::new() }; $size];
         $crate::Cache::new_static(&ENTRIES, $hasher)
     }};
 }
@@ -227,7 +258,7 @@ mod tests {
         let cache: Cache<u64, u64> = static_cache!(u64, u64, 1024);
 
         let mut computed = false;
-        let value = cache.get_or_insert_with(&42, |&k| {
+        let value = cache.get_or_insert_with(42, |&k| {
             computed = true;
             k * 2
         });
@@ -235,7 +266,7 @@ mod tests {
         assert_eq!(value, 84);
 
         computed = false;
-        let value = cache.get_or_insert_with(&42, |&k| {
+        let value = cache.get_or_insert_with(42, |&k| {
             computed = true;
             k * 2
         });
@@ -247,8 +278,8 @@ mod tests {
     fn test_different_keys() {
         let cache: Cache<String, usize> = static_cache!(String, usize, 1024);
 
-        let v1 = cache.get_or_insert_with(&"hello".to_string(), |s| s.len());
-        let v2 = cache.get_or_insert_with(&"world!".to_string(), |s| s.len());
+        let v1 = cache.get_or_insert_with("hello".to_string(), |s| s.len());
+        let v2 = cache.get_or_insert_with("world!".to_string(), |s| s.len());
 
         assert_eq!(v1, 5);
         assert_eq!(v2, 6);
