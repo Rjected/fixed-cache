@@ -1,7 +1,3 @@
-//! A minimalistic one-way set associative cache, generic over key-value types.
-//!
-//! This cache has a fixed size to allow fast access and minimize per-call overhead.
-
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::new_without_default)]
@@ -21,16 +17,53 @@ type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHa
 #[cfg(not(feature = "rapidhash"))]
 type DefaultBuildHasher = std::hash::RandomState;
 
-/// A concurrent set-associative cache, generic over key-value types.
+/// A concurrent, fixed-size, set-associative cache.
 ///
-/// The cache uses a fixed number of entries and resolves collisions by eviction.
-/// It is designed for fast access with minimal per-call overhead.
+/// This cache maps keys to values using a fixed number of buckets. Each key hashes to exactly
+/// one bucket, and collisions are resolved by eviction (the new value replaces the old one).
+///
+/// # Thread Safety
+///
+/// The cache is safe to share across threads (`Send + Sync`). All operations use atomic
+/// instructions and never block, making it suitable for high-contention scenarios.
+///
+/// # Limitations
+///
+/// - **No `Drop` support**: Key and value types must not implement `Drop`. Use `Copy` types,
+///   primitives, or `&'static` references.
+/// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is lost.
+/// - **No iteration or removal**: Individual entries cannot be enumerated or explicitly removed.
 ///
 /// # Type Parameters
 ///
-/// - `K`: The key type, must implement `Hash + Eq`.
-/// - `V`: The value type, must implement `Clone`.
-/// - `S`: The hash builder type, must implement `BuildHasher`.
+/// - `K`: The key type. Must implement [`Hash`] + [`Eq`] and must not implement [`Drop`].
+/// - `V`: The value type. Must implement [`Clone`] and must not implement [`Drop`].
+/// - `S`: The hash builder type. Must implement [`BuildHasher`]. Defaults to [`RandomState`] or
+///   [`rapidhash`] if the `rapidhash` feature is enabled.
+///
+/// # Example
+///
+/// ```
+/// use fixed_cache::Cache;
+///
+/// let cache: Cache<u64, u64> = Cache::new(256, Default::default());
+///
+/// // Insert a value
+/// cache.insert(42, 100);
+/// assert_eq!(cache.get(&42), Some(100));
+///
+/// // Get or compute a value
+/// let value = cache.get_or_insert_with(123, |&k| k * 2);
+/// assert_eq!(value, 246);
+/// ```
+///
+/// [`Hash`]: core::hash::Hash
+/// [`Eq`]: core::cmp::Eq
+/// [`Clone`]: core::clone::Clone
+/// [`Drop`]: core::ops::Drop
+/// [`BuildHasher`]: core::hash::BuildHasher
+/// [`RandomState`]: std::hash::RandomState
+/// [`rapidhash`]: https://crates.io/crates/rapidhash
 pub struct Cache<K, V, S = DefaultBuildHasher> {
     entries: *const [Bucket<(K, V)>],
     build_hasher: S,
@@ -60,10 +93,10 @@ where
     ///
     /// Panics if `num` is not a power of two.
     pub fn new(num: usize, build_hasher: S) -> Self {
-        let bytes = num * size_of::<Bucket<(K, V)>>();
-        let raw = Box::into_raw(vec![0u8; bytes].into_boxed_slice());
-        let cast = std::ptr::slice_from_raw_parts_mut(raw.cast(), num);
-        Self::new_inner(cast, build_hasher, false)
+        assert!(num.is_power_of_two(), "capacity must be a power of two");
+        let entries =
+            Box::into_raw((0..num).map(|_| Bucket::new()).collect::<Vec<_>>().into_boxed_slice());
+        Self::new_inner(entries, build_hasher, true)
     }
 
     /// Creates a new cache with the specified entries and hasher.
@@ -78,6 +111,10 @@ where
 
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
+        const {
+            assert!(!std::mem::needs_drop::<K>(), "dropping keys is not supported yet");
+            assert!(!std::mem::needs_drop::<V>(), "dropping values is not supported yet");
+        }
         assert!(entries.len().is_power_of_two());
         Self { entries, build_hasher, drop }
     }
@@ -197,11 +234,11 @@ where
     ///
     /// [`get_or_insert_with`]: Self::get_or_insert_with
     #[inline]
-    pub fn get_or_insert_with_ref<Q, F, Cvt>(&self, key: &Q, f: F, cvt: Cvt) -> V
+    pub fn get_or_insert_with_ref<'a, Q, F, Cvt>(&self, key: &'a Q, f: F, cvt: Cvt) -> V
     where
         Q: ?Sized + Hash + Equivalent<K>,
-        F: FnOnce(&Q) -> V,
-        Cvt: FnOnce(&Q) -> K,
+        F: FnOnce(&'a Q) -> V,
+        Cvt: FnOnce(&'a Q) -> K,
     {
         let (bucket, tag) = self.calc(key);
         if let Some(v) = self.get_inner(key, bucket, tag) {
@@ -241,8 +278,16 @@ impl<K, V, S> Drop for Cache<K, V, S> {
     }
 }
 
-/// A cache bucket.
+/// A single cache bucket that holds one key-value pair.
+///
+/// Buckets are aligned to 128 bytes to avoid false sharing between cache lines.
+/// Each bucket contains an atomic tag for lock-free synchronization and uninitialized
+/// storage for the data.
+///
+/// This type is public to allow use with the [`static_cache!`] macro for compile-time
+/// cache initialization. You typically don't need to interact with it directly.
 #[repr(C, align(128))]
+#[doc(hidden)]
 pub struct Bucket<T> {
     tag: AtomicUsize,
     data: UnsafeCell<MaybeUninit<T>>,
@@ -319,6 +364,10 @@ mod tests {
     use super::*;
     use std::thread;
 
+    const fn iters(n: usize) -> usize {
+        if cfg!(miri) { n / 10 } else { n }
+    }
+
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
     }
@@ -346,10 +395,10 @@ mod tests {
 
     #[test]
     fn test_different_keys() {
-        let cache: Cache<String, usize> = static_cache!(String, usize, 1024);
+        let cache: Cache<&'static str, usize> = static_cache!(&'static str, usize, 1024);
 
-        let v1 = cache.get_or_insert_with("hello".to_string(), |s| s.len());
-        let v2 = cache.get_or_insert_with("world!".to_string(), |s| s.len());
+        let v1 = cache.get_or_insert_with("hello", |s| s.len());
+        let v2 = cache.get_or_insert_with("world!", |s| s.len());
 
         assert_eq!(v1, 5);
         assert_eq!(v2, 6);
@@ -372,15 +421,15 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let cache: Cache<u64, String> = new_cache(64);
+        let cache: Cache<u64, &'static str> = new_cache(64);
 
-        cache.insert(1, "one".to_string());
-        cache.insert(2, "two".to_string());
-        cache.insert(3, "three".to_string());
+        cache.insert(1, "one");
+        cache.insert(2, "two");
+        cache.insert(3, "three");
 
-        assert_eq!(cache.get(&1), Some("one".to_string()));
-        assert_eq!(cache.get(&2), Some("two".to_string()));
-        assert_eq!(cache.get(&3), Some("three".to_string()));
+        assert_eq!(cache.get(&1), Some("one"));
+        assert_eq!(cache.get(&2), Some("two"));
+        assert_eq!(cache.get(&3), Some("three"));
         assert_eq!(cache.get(&4), None);
     }
 
@@ -398,22 +447,22 @@ mod tests {
 
     #[test]
     fn test_get_or_insert_with_ref() {
-        let cache: Cache<String, usize> = new_cache(64);
+        let cache: Cache<&'static str, usize> = new_cache(64);
 
         let key = "hello";
-        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s.to_string());
+        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s);
         assert_eq!(value, 5);
 
-        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s.to_string());
+        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s);
         assert_eq!(value2, 5);
     }
 
     #[test]
     fn test_get_or_insert_with_ref_different_keys() {
-        let cache: Cache<String, usize> = new_cache(1024);
+        let cache: Cache<&'static str, usize> = new_cache(1024);
 
-        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s.to_string());
-        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s.to_string());
+        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s);
+        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s);
 
         assert_eq!(v1, 3);
         assert_eq!(v2, 6);
@@ -449,14 +498,15 @@ mod tests {
 
     #[test]
     fn test_many_entries() {
-        let cache = new_cache(1024);
+        let cache: Cache<u64, u64> = new_cache(1024);
+        let n = iters(500);
 
-        for i in 0..500 {
+        for i in 0..n as u64 {
             cache.insert(i, i * 2);
         }
 
         let mut hits = 0;
-        for i in 0..500 {
+        for i in 0..n as u64 {
             if cache.get(&i) == Some(i * 2) {
                 hits += 1;
             }
@@ -466,20 +516,20 @@ mod tests {
 
     #[test]
     fn test_string_keys() {
-        let cache = new_cache(64);
+        let cache: Cache<&'static str, i32> = new_cache(1024);
 
-        cache.insert("alpha".to_string(), 1);
-        cache.insert("beta".to_string(), 2);
-        cache.insert("gamma".to_string(), 3);
+        cache.insert("alpha", 1);
+        cache.insert("beta", 2);
+        cache.insert("gamma", 3);
 
-        assert_eq!(cache.get(&"alpha".to_string()), Some(1));
-        assert_eq!(cache.get(&"beta".to_string()), Some(2));
-        assert_eq!(cache.get(&"gamma".to_string()), Some(3));
+        assert_eq!(cache.get(&"alpha"), Some(1));
+        assert_eq!(cache.get(&"beta"), Some(2));
+        assert_eq!(cache.get(&"gamma"), Some(3));
     }
 
     #[test]
     fn test_zero_values() {
-        let cache = new_cache(64);
+        let cache: Cache<u64, u64> = new_cache(64);
 
         cache.insert(0, 0);
         assert_eq!(cache.get(&0), Some(0));
@@ -491,13 +541,13 @@ mod tests {
     #[test]
     fn test_clone_value() {
         #[derive(Clone, PartialEq, Debug)]
-        struct MyValue(Vec<u8>);
+        struct MyValue(u64);
 
         let cache: Cache<u64, MyValue> = new_cache(64);
 
-        cache.insert(1, MyValue(vec![1, 2, 3]));
+        cache.insert(1, MyValue(123));
         let v = cache.get(&1);
-        assert_eq!(v, Some(MyValue(vec![1, 2, 3])));
+        assert_eq!(v, Some(MyValue(123)));
     }
 
     fn run_concurrent<F>(num_threads: usize, f: F)
@@ -514,14 +564,15 @@ mod tests {
 
     #[test]
     fn test_concurrent_reads() {
-        let cache = new_cache(1024);
+        let cache: Cache<u64, u64> = new_cache(1024);
+        let n = iters(100);
 
-        for i in 0..100 {
+        for i in 0..n as u64 {
             cache.insert(i, i * 10);
         }
 
         run_concurrent(4, |_| {
-            for i in 0..100 {
+            for i in 0..n as u64 {
                 let _ = cache.get(&i);
             }
         });
@@ -529,10 +580,11 @@ mod tests {
 
     #[test]
     fn test_concurrent_writes() {
-        let cache = new_cache(1024);
+        let cache: Cache<u64, u64> = new_cache(1024);
+        let n = iters(100);
 
         run_concurrent(4, |t| {
-            for i in 0..100 {
+            for i in 0..n {
                 cache.insert((t * 1000 + i) as u64, i as u64);
             }
         });
@@ -540,10 +592,11 @@ mod tests {
 
     #[test]
     fn test_concurrent_read_write() {
-        let cache = new_cache(256);
+        let cache: Cache<u64, u64> = new_cache(256);
+        let n = iters(1000);
 
         run_concurrent(2, |t| {
-            for i in 0..1000u64 {
+            for i in 0..n as u64 {
                 if t == 0 {
                     cache.insert(i % 100, i);
                 } else {
@@ -555,15 +608,16 @@ mod tests {
 
     #[test]
     fn test_concurrent_get_or_insert() {
-        let cache = new_cache(1024);
+        let cache: Cache<u64, u64> = new_cache(1024);
+        let n = iters(100);
 
         run_concurrent(8, |_| {
-            for i in 0..100 {
+            for i in 0..n as u64 {
                 let _ = cache.get_or_insert_with(i, |&k| k * 2);
             }
         });
 
-        for i in 0..100 {
+        for i in 0..n as u64 {
             if let Some(v) = cache.get(&i) {
                 assert_eq!(v, i * 2);
             }
@@ -602,50 +656,19 @@ mod tests {
     fn test_equivalent_key_lookup() {
         let cache = new_cache(64);
 
-        cache.insert("hello".to_string(), 42);
+        cache.insert("hello", 42);
 
-        assert_eq!(cache.get(&"hello".to_string()), Some(42));
+        assert_eq!(cache.get(&"hello"), Some(42));
     }
 
     #[test]
     fn test_large_values() {
-        let cache = new_cache(64);
+        let cache: Cache<u64, [u8; 1000]> = new_cache(64);
 
-        let large_value: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        cache.insert(1, large_value.clone());
+        let large_value = [42u8; 1000];
+        cache.insert(1, large_value);
 
         assert_eq!(cache.get(&1), Some(large_value));
-    }
-
-    #[test]
-    fn test_get_or_insert_does_not_leak_key() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Hash, PartialEq, Eq)]
-        struct DropKey(u64);
-
-        impl Drop for DropKey {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        impl Clone for DropKey {
-            fn clone(&self) -> Self {
-                DropKey(self.0)
-            }
-        }
-
-        {
-            let cache: Cache<DropKey, u64> = new_cache(64);
-
-            let _ = cache.get_or_insert_with(DropKey(1), |k| k.0 * 2);
-            let _ = cache.get_or_insert_with(DropKey(1), |k| k.0 * 2);
-        }
-
-        assert!(DROP_COUNT.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
