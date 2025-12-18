@@ -2,14 +2,21 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::new_without_default)]
 
-use core::{
+use equivalent::Equivalent;
+use std::{
     cell::UnsafeCell,
+    convert::Infallible,
+    fmt,
     hash::{BuildHasher, Hash},
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use equivalent::Equivalent;
-use std::convert::Infallible;
+
+#[cfg(feature = "stats")]
+mod stats;
+#[cfg(feature = "stats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
+pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
 
 const NEEDED_BITS: usize = 2;
 const LOCKED_BIT: usize = 1 << 0;
@@ -58,21 +65,23 @@ type DefaultBuildHasher = std::hash::RandomState;
 /// assert_eq!(value, 246);
 /// ```
 ///
-/// [`Hash`]: core::hash::Hash
-/// [`Eq`]: core::cmp::Eq
-/// [`Clone`]: core::clone::Clone
-/// [`Drop`]: core::ops::Drop
-/// [`BuildHasher`]: core::hash::BuildHasher
+/// [`Hash`]: std::hash::Hash
+/// [`Eq`]: std::cmp::Eq
+/// [`Clone`]: std::clone::Clone
+/// [`Drop`]: std::ops::Drop
+/// [`BuildHasher`]: std::hash::BuildHasher
 /// [`RandomState`]: std::hash::RandomState
 /// [`rapidhash`]: https://crates.io/crates/rapidhash
 pub struct Cache<K, V, S = DefaultBuildHasher> {
     entries: *const [Bucket<(K, V)>],
     build_hasher: S,
+    #[cfg(feature = "stats")]
+    stats: Option<Stats<K, V>>,
     drop: bool,
 }
 
-impl<K, V, S> core::fmt::Debug for Cache<K, V, S> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<K, V, S> fmt::Debug for Cache<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cache").finish_non_exhaustive()
     }
 }
@@ -114,9 +123,30 @@ where
         Self::new_inner(entries, build_hasher, false)
     }
 
+    /// Sets the cache's statistics.
+    #[cfg(feature = "stats")]
+    #[inline]
+    pub fn with_stats(mut self, stats: Option<Stats<K, V>>) -> Self {
+        self.set_stats(stats);
+        self
+    }
+
+    /// Sets the cache's statistics.
+    #[cfg(feature = "stats")]
+    #[inline]
+    pub fn set_stats(&mut self, stats: Option<Stats<K, V>>) {
+        self.stats = stats;
+    }
+
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
-        Self { entries, build_hasher, drop }
+        Self {
+            entries,
+            build_hasher,
+            #[cfg(feature = "stats")]
+            stats: None,
+            drop,
+        }
     }
 
     #[inline]
@@ -134,7 +164,7 @@ where
     #[inline]
     const fn index_mask(&self) -> usize {
         let n = self.capacity();
-        unsafe { core::hint::assert_unchecked(n.is_power_of_two()) };
+        unsafe { std::hint::assert_unchecked(n.is_power_of_two()) };
         n - 1
     }
 
@@ -153,6 +183,12 @@ where
     #[inline]
     pub const fn capacity(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Returns the statistics of this cache.
+    #[cfg(feature = "stats")]
+    pub const fn stats(&self) -> Option<&Stats<K, V>> {
+        self.stats.as_ref()
     }
 }
 
@@ -181,14 +217,24 @@ where
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
+                #[cfg(feature = "stats")]
+                if let Some(stats) = &self.stats {
+                    stats.record_hit(ck, v);
+                }
                 let v = v.clone();
                 bucket.unlock(tag);
                 return Some(v);
             }
+            #[cfg(feature = "stats")]
+            if let Some(stats) = &self.stats {
+                stats.record_collision(AnyRef::new(&key), ck, v);
+            }
             bucket.unlock(tag);
-            // Hash collision: same hash but different key.
         }
-
+        #[cfg(feature = "stats")]
+        if let Some(stats) = &self.stats {
+            stats.record_miss(AnyRef::new(&key));
+        }
         None
     }
 
@@ -212,7 +258,7 @@ where
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
                 // Drop old value if bucket was alive.
                 if Self::NEEDS_DROP && (prev_tag & ALIVE_BIT) != 0 {
-                    core::ptr::drop_in_place(data);
+                    std::ptr::drop_in_place(data);
                 }
                 (&raw mut (*data).0).write(make_key());
                 (&raw mut (*data).1).write(make_value());
@@ -419,11 +465,11 @@ impl<T> Drop for Bucket<T> {
 /// static MY_CACHE: Cache<u64, &'static str, BuildHasher> =
 ///     static_cache!(u64, &'static str, 1024, BuildHasher::new());
 ///
-/// let value = MY_CACHE.get_or_insert_with(&42, |_k| "hi");
+/// let value = MY_CACHE.get_or_insert_with(42, |_k| "hi");
 /// assert_eq!(value, "hi");
 ///
-/// let new_value = MY_CACHE.get_or_insert_with(&42, |_k| "not hi");
-/// assert_eq!(new_value, "not hi");
+/// let new_value = MY_CACHE.get_or_insert_with(42, |_k| "not hi");
+/// assert_eq!(new_value, "hi");
 /// # }
 /// ```
 #[macro_export]
